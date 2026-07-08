@@ -141,3 +141,46 @@ for Issues #1 and #5.
 | 5 | Playlist with 7 entries (positions 1–7); call `get_playlist_songs`. | Returns **6** songs, missing "Track 7" — the highest position / most recently added. |
 
 At this checkpoint no application code had been changed.
+
+---
+
+## Milestone 3 — Root Cause Analysis Entries
+
+### RCA #1 — Issue #1: My listening streak keeps resetting
+
+**1. Issue number and title:** #1 — My listening streak keeps resetting (every Sunday).
+
+**2. How I reproduced it:** In an in-memory DB I set a user to `listening_streak = 12` with
+`last_listened_at` on a Saturday (`datetime(2024, 6, 15)`, `weekday() == 5`), then called
+`update_listening_streak(user, sunday)` with `datetime(2024, 6, 16)` (`weekday() == 6`). The
+streak dropped to **1** instead of 13. As a control I ran the identical sequence ending on a
+Monday and got **13**, which isolated the fault to Sundays specifically. The shipped test
+`test_streak_increments_on_sunday` also failed with `assert 1 == 2`.
+
+**3. How I found the root cause:** I traced the streak feature top-down from
+`POST /songs/<id>/listen` → `routes/songs.py: listen()` →
+`streak_service.record_listening_event()` → `update_listening_streak()`. The reset happens in
+the day-difference branch in `update_listening_streak`. The `days_since_last == 1` branch —
+the one that should increment on a consecutive day — carried an extra condition
+`and today.weekday() != 6`. The moment I saw `weekday() != 6` I checked what `weekday()`
+returns for Sunday: `datetime.weekday()` is **Monday=0 … Sunday=6**. So for a consecutive-day
+listen that falls on a Sunday, `today.weekday() == 6`, the `elif` is `False`, and execution
+falls through to the `else`, which resets the streak to 1. That's the exact line and the exact
+reason it's Sunday-only.
+
+**4. The root cause:** Python's `datetime.weekday()` returns `6` for Sunday. The increment
+branch was written as `elif days_since_last == 1 and today.weekday() != 6:`. There is no
+legitimate reason for a streak to care which weekday it is — consecutive is consecutive — but
+this clause specifically excludes Sundays from being counted as a consecutive day. Every Sunday
+listen (even one that directly follows a Saturday listen) was therefore treated like a skipped
+day and reset the streak to 1. This is why kenji's 12-day streak collapsed to 1 both times, and
+both times it was a Sunday.
+
+**5. My fix and side-effect check:** I removed the spurious weekday clause, changing
+`elif days_since_last == 1 and today.weekday() != 6:` to `elif days_since_last == 1:`. Now any
+listen exactly one calendar day after the previous one increments the streak regardless of
+weekday. Side-effect check: I confirmed the other three branches are untouched and still
+correct — `days_since_last == 0` (same day, no change), and `days_since_last > 1` (real gap,
+resets to 1). All five tests in `tests/test_streaks.py` pass, including
+`test_streak_resets_after_skipped_day` (a genuine skipped day still resets) and
+`test_streak_does_not_double_count_same_day` — so both sides of the day boundary still behave.
