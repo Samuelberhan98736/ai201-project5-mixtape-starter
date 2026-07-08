@@ -7,7 +7,38 @@
 
 ## AI Usage
 
-_(Filled in fully in Milestone 4. See the "AI Usage" section at the end of this document for the complete write-up of how AI tools were used during navigation and debugging.)_
+I used an AI assistant (Claude) throughout this project, primarily for **codebase navigation and
+explanation**, and I verified every diagnosis against the running code before acting on it. Being
+honest about the split:
+
+**Where AI helped and was reliable — navigation and explanation:**
+
+- **Orientation.** I had it summarize each service file's responsibility and trace the two call
+  chains in my codebase map (route → service → model). This was fast and accurate because the
+  app's layering is clean and consistent.
+- **Explaining specific mechanics I then confirmed.** For the streak bug I asked what
+  `datetime.weekday()` returns for each day and verified against the docs (Monday=0 … Sunday=6);
+  for the feed bug it helped me articulate the difference between a rolling 24-hour window and a
+  calendar-day boundary. For Issue #4 it helped me diff `rate_song` against `add_to_playlist`
+  line-by-line to spot the missing notification block.
+
+**Where AI's first read was plausible-but-wrong, and I had to verify myself — Issue #3:**
+
+This is the clearest example of the "AI is unreliable for diagnosing before you've read the code"
+warning in the brief. Reading `search_songs` on its own, the obvious AI-style conclusion was
+"the `outerjoin` produces duplicates — add `.distinct()`." But when I actually **ran** it, the
+shipped test `test_search_no_duplicates_multi_tag_song` *passed* and a direct call returned the
+song only once — the confident-sounding diagnosis was contradicted by the code's real behavior.
+Only by dropping into the query itself and counting rows three ways (`query(Song).all()` → 1 row,
+but `select(Song).scalars().all()` and a raw column select → 3 rows) did the true story emerge:
+the join really does duplicate rows, and it was being masked by SQLAlchemy's legacy `Query.all()`
+implicit entity de-duplication. That verification step changed the fix from a superficial
+`.distinct()` to removing the pointless join at its source. **Reading and running the code — not
+the AI's first guess — is what produced the correct root cause.**
+
+**How work was verified:** every fix was checked by running the shipped pytest suite plus
+controlled in-memory reproductions of each reported scenario (including both sides of the
+day/midnight/list-length boundaries), before committing.
 
 ---
 
@@ -361,3 +392,38 @@ still returns `[]` (previously `[][:-1]` was also `[]`, so that case happened to
 position order. All three tests in `tests/test_playlists.py` pass, including
 `test_playlist_returns_songs_in_order` (order preserved) and
 `test_empty_playlist_returns_empty_list`. The full suite is now **13 passed**.
+
+---
+
+## Milestone 4 — Regression Tests
+
+The stretch requirement asks for at least one test that would have caught a bug before it was
+introduced. Issues #1, #3, and #5 already ship with such tests in the starter
+(`tests/test_streaks.py::test_streak_increments_on_sunday`,
+`tests/test_search.py::test_search_no_duplicates_multi_tag_song`,
+`tests/test_playlists.py::test_playlist_returns_all_songs`) — all three failed before my fixes
+and pass after.
+
+To cover the two bugs that had **no** existing tests, I added new regression suites:
+
+- **`tests/test_feed.py`** (Issue #2)
+  - `test_friend_from_last_night_is_excluded` — a friend who listened 30 min before today's
+    midnight must not appear in "listening now" (the exact reported scenario).
+  - `test_friend_from_this_morning_is_included` — the other side of the boundary still appears.
+- **`tests/test_notifications.py`** (Issue #4)
+  - `test_rating_creates_notification_for_sharer` — rating a shared song creates one
+    `song_rated` notification for the sharer.
+  - `test_rating_own_song_creates_no_notification` — self-rating notifies no one.
+  - `test_updating_a_rating_does_not_duplicate_the_rating_row` — re-rating updates the score.
+
+I confirmed these are true regression tests by running them against the pre-fix code: both
+`test_friend_from_last_night_is_excluded` and `test_rating_creates_notification_for_sharer`
+**fail** on the original code (the feed returns the last-night friend; ratings produce
+`assert 0 == 1`) and **pass** after the fixes. Full suite after all fixes and new tests:
+**18 passed.**
+
+Run them with:
+
+```bash
+pytest tests/
+```
