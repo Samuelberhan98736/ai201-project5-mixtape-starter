@@ -271,3 +271,53 @@ modern `select(Song).scalars().all()` path and now get the correct row count wit
 multiplication — proving the fix addresses the cause, not just the legacy-API symptom. (c) All
 five tests in `tests/test_search.py` pass, including the 0-tag, 1-tag, and multi-tag
 no-duplicate cases and the empty-result case.
+
+### RCA #4 — Issue #4: Notified when a friend added my song to a playlist but not when they rated it
+
+**1. Issue number and title:** #4 — Ratings never create a notification, even though
+playlist-adds do.
+
+**2. How I reproduced it:** Owner `aaliya` shares a song; friend `kenji` calls
+`rate_song(kenji, song, 5)`. I counted the owner's notifications before and after: **0 → 0**.
+The `Rating` row is created (the score is saved and returned), but no `Notification` row is ever
+produced, so `get_notifications(owner)` stays empty — matching aaliya's report that the rating
+shows on the song but no notification arrives.
+
+**3. How I found the root cause:** The hint said the cause is *architectural, not a typo*, and to
+compare the working notification path to the broken one line-by-line. Both actions live in the
+same file, `services/notification_service.py`: `add_to_playlist()` (works) and `rate_song()`
+(broken). I traced `POST /songs/<id>/rate` → `routes/songs.py: rate()` → `rate_song()` and read
+it end to end: it validates the score, loads the song and rater, upserts the `Rating`, commits,
+and returns. Then I read `add_to_playlist()` right above it and saw the structural difference:
+`add_to_playlist` ends with a block —
+`if song.shared_by != added_by_user_id: create_notification(user_id=song.shared_by, …)` —
+that notifies the song's original sharer. `rate_song` has **no equivalent block at all.** That
+absent block is the whole bug.
+
+**4. The root cause:** `rate_song()` persists the rating but never calls `create_notification()`.
+The notification-on-interaction step that its sibling `add_to_playlist()` performs was simply
+never written for the rating path. It isn't a broken condition or a typo — the code to create
+the notification is entirely missing. So ratings are saved correctly and are visible on the song,
+but the sharer is never told, for anyone.
+
+**5. My fix and side-effect check:** I added a notification block to `rate_song()`, placed after
+the rating is committed and modeled exactly on `add_to_playlist()`:
+
+```python
+if song.shared_by != user_id:
+    create_notification(
+        user_id=song.shared_by,
+        notification_type="song_rated",
+        body=f"{rater.username} rated your song '{song.title}' {score} stars.",
+    )
+```
+
+The `song.shared_by != user_id` guard mirrors `add_to_playlist` so a user rating their *own*
+shared song doesn't notify themselves. Side-effect checks: (a) a friend rating a shared song now
+yields exactly one `song_rated` notification with a correct body, retrievable via
+`get_notifications`; (b) a user rating their own song produces **zero** notifications; (c) the
+rating upsert itself is unchanged — the update path (re-rating an already-rated song) still
+returns the `Rating` and updates the score; (d) `add_to_playlist` and `create_notification` were
+not modified, so the existing, working playlist-add notification behavior is untouched. I used a
+new `notification_type` of `"song_rated"`, matching the naming style of the existing
+`"song_added_to_playlist"` type.
