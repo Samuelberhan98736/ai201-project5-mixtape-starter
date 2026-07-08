@@ -118,3 +118,26 @@ POST /songs/<song_id>/listen
 I read all five issue descriptions before choosing. I plan to fix **all five** (they are
 independent, single-service bugs), starting with #1, #3, and #5 as the required three because
 each already has a failing regression test in `tests/` I can verify against.
+
+---
+
+## Milestone 2 — Reproduction (before touching any code)
+
+I reproduced every bug by calling the service functions directly against a fresh in-memory
+database seeded to mirror each reporter's conditions (faster and more controllable than firing
+HTTP requests, as the brief suggests). I also ran the shipped test suite as a baseline.
+
+**Baseline `pytest tests/`:** `3 failed, 10 passed`.
+Failing: `test_streak_increments_on_sunday`, `test_playlist_returns_all_songs`,
+`test_playlist_returns_songs_in_order`. These are effectively pre-written regression tests
+for Issues #1 and #5.
+
+| # | Reproduction (controlled inputs) | Observed vs. expected |
+|---|----------------------------------|-----------------------|
+| 1 | User with streak 12, `last_listened_at` = Saturday; call `update_listening_streak(user, Sunday)`. Control: same setup ending on Monday. | Sunday → streak **1** (expected 13). Monday control → **13**. Confirms it's Sunday-specific. |
+| 2 | `now` = 09:00 today; friend `darius` has one `ListeningEvent` at ~11pm "last night" (10h ago, but before today's midnight). Call `get_friends_listening_now`. | Feed **shows darius** (expected: excluded, since his play was on a previous calendar day). |
+| 3 | Song "Crown Heights Anthem" with 3 tags; call `search_songs("Anthem")`. | Via `search_songs` (legacy `Query.all()`): appears **1×** — the reported dup is *masked*. Digging in: the `outerjoin(song_tags)` emits **3 raw rows** (`select(Song.id)…` → 3; `select(Song).scalars().all()` → 3). Only the legacy Query API's implicit entity de-duplication hides it. **The duplicate-producing join is real and latent.** (See RCA #3 for the full explanation.) |
+| 4 | Owner shares a song; a friend calls `rate_song(friend, song, 5)`. Count owner's notifications before/after. | before **0**, after **0** (expected after = 1). No notification row is ever created. |
+| 5 | Playlist with 7 entries (positions 1–7); call `get_playlist_songs`. | Returns **6** songs, missing "Track 7" — the highest position / most recently added. |
+
+At this checkpoint no application code had been changed.
