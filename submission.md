@@ -225,3 +225,49 @@ does not use the cutoff. The `>=` comparison keeps an event landing exactly at 0
 "today," which is correct. (Note: the boundary is UTC, matching how the app stores all
 timestamps; a per-user local-midnight boundary would be a larger feature, out of scope for a
 targeted bug fix.)
+
+### RCA #3 — Issue #3: The same song keeps showing up twice in search
+
+**1. Issue number and title:** #3 — Some songs appear two or three times in search results.
+
+**2. How I reproduced it:** This is the "conditional" bug from the hints, and reproducing it
+was the most interesting part. I created "Crown Heights Anthem" with 3 tags and called
+`search_songs("Anthem")`. Through the service function it came back **once** — the reported
+duplication did *not* appear, and the shipped `test_search_no_duplicates_multi_tag_song` passed.
+Rather than conclude "no bug," I inspected the SQL the function builds. Running the same
+`outerjoin(song_tags)` query three ways on the 3-tag song:
+`db.session.query(Song).all()` → **1 row**; `select(Song.id)…outerjoin…` → **3 rows**;
+`select(Song).scalars().all()` → **3 rows**. So the join really does emit one duplicate row per
+tag; the only reason the service looked correct is the legacy `Query.all()` API's implicit
+entity de-duplication.
+
+**3. How I found the root cause:** I traced `GET /songs/search` → `routes/songs.py: search()`
+→ `search_service.search_songs()`. The query is
+`db.session.query(Song).outerjoin(song_tags, Song.id == song_tags.c.song_id).filter(title/artist ILIKE …)`.
+The moment that made me confident: I noticed the `filter` only references `Song.title` and
+`Song.artist` — **nothing in the query uses `song_tags` at all.** The join is pure dead weight,
+and because `song_tags` has one row per (song, tag), an inner/outer join over it multiplies each
+song by its tag count. A 0- or 1-tag song stays at one row (which is why "other songs only show
+up once"); a 3-tag song fans out to three identical rows. That precisely matches simone's report
+of *"Crown Heights Anthem … three times"* while other songs appear once.
+
+**4. The root cause:** `search_songs` joins the `song_tags` association table into a query that
+never needs it. The join multiplies result rows by the number of tags on each song, producing
+duplicate `Song` entries. The severity is *conditional*: it only manifests for songs with more
+than one tag, and today the user-facing symptom is partly masked by SQLAlchemy's legacy
+`Query.all()` de-duplicating repeated entities. That masking is fragile — it disappears the
+moment the query selects an extra column, uses `.scalars()`, or is migrated to the recommended
+2.0-style `select()` API (all of which I demonstrated returning 3 rows). The duplicate-producing
+join is the real defect regardless of which API currently hides it.
+
+**5. My fix and side-effect check:** I removed the `outerjoin(song_tags, …)` line entirely so the
+query is just `db.session.query(Song).filter(title/artist ILIKE …).all()`, and dropped the
+now-unused `Tag` / `song_tags` imports. This kills the row multiplication at the source rather
+than papering over it with `.distinct()`. Side-effect check: (a) tags still appear in each
+result — `to_dict()` reads `self.tags`, which is a separate `lazy="subquery"` relationship load,
+so it's unaffected by dropping the join; I confirmed the fixed search still returns
+`['rap', 'hip-hop', 'boom bap']` for the multi-tag song. (b) I re-ran the query through the
+modern `select(Song).scalars().all()` path and now get the correct row count with no
+multiplication — proving the fix addresses the cause, not just the legacy-API symptom. (c) All
+five tests in `tests/test_search.py` pass, including the 0-tag, 1-tag, and multi-tag
+no-duplicate cases and the empty-result case.
