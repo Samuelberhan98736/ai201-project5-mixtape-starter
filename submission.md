@@ -184,3 +184,44 @@ correct — `days_since_last == 0` (same day, no change), and `days_since_last >
 resets to 1). All five tests in `tests/test_streaks.py` pass, including
 `test_streak_resets_after_skipped_day` (a genuine skipped day still resets) and
 `test_streak_does_not_double_count_same_day` — so both sides of the day boundary still behave.
+
+### RCA #2 — Issue #2: Friends Listening Now shows people from yesterday
+
+**1. Issue number and title:** #2 — "Friends Listening Now" shows friends whose last listen was
+yesterday evening.
+
+**2. How I reproduced it:** With `now` set to 09:00 today, I created a friend (`darius`) with a
+single `ListeningEvent` timestamped ~11pm the previous night (about 10 hours earlier, but on
+the previous calendar day), then called `get_friends_listening_now(me)`. Darius appeared in the
+feed even though his only play was the night before. To pin down the boundary I later created
+two friends — one who played 30 minutes *before* midnight and one who played 30 minutes
+*after* — and confirmed the pre-midnight one should drop off while the post-midnight one stays.
+
+**3. How I found the root cause:** I traced `GET /feed/<id>/listening-now` →
+`routes/feed.py: listening_now()` → `feed_service.get_friends_listening_now()`. The function
+filters listening events with `ListeningEvent.listened_at >= cutoff`. I read how `cutoff` was
+computed: `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD`, where
+`RECENT_THRESHOLD = timedelta(hours=24)`. That made me confident this was the cause: a
+`now − 24h` cutoff is a **rolling 24-hour window**, which is a different thing from "today."
+Plugging in the numbers confirmed it: at 09:00, the cutoff is 09:00 *yesterday*, so an event at
+23:00 yesterday (10 hours before now) is comfortably inside the window and is returned.
+
+**4. The root cause:** The feed defined "recently / listening now" as *"within the last 24
+hours"* (`now - timedelta(hours=24)`) rather than *"today, this calendar day."* Because it's a
+sliding window anchored to the current instant, any play from yesterday evening stays in the
+window until the same clock time the next day — exactly the "hangs around until the same time
+the next day" behavior nova described. The two definitions only agree at midnight; at every
+other time of day the rolling window leaks in part of the previous calendar day.
+
+**5. My fix and side-effect check:** I changed the cutoff from `now - 24h` to the **start of the
+current UTC day**: `cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0,
+microsecond=0)`, and removed the now-unused `RECENT_THRESHOLD` constant (and the unused
+`timedelta` import). Now only events with `listened_at >= today-00:00 UTC` are included, which
+is precisely "listened today." Side-effect check: I verified both sides of the midnight boundary
+with a controlled test — a friend who played 30 min before midnight is correctly excluded, and
+a friend who played 30 min after midnight is still shown. I also confirmed I did **not** touch
+`get_activity_feed`, which is intentionally unfiltered by recency (its docstring says so) and
+does not use the cutoff. The `>=` comparison keeps an event landing exactly at 00:00:00 in
+"today," which is correct. (Note: the boundary is UTC, matching how the app stores all
+timestamps; a per-user local-midnight boundary would be a larger feature, out of scope for a
+targeted bug fix.)
