@@ -321,3 +321,43 @@ returns the `Rating` and updates the score; (d) `add_to_playlist` and `create_no
 not modified, so the existing, working playlist-add notification behavior is untouched. I used a
 new `notification_type` of `"song_rated"`, matching the naming style of the existing
 `"song_added_to_playlist"` type.
+
+### RCA #5 — Issue #5: The last song in a playlist never shows up
+
+**1. Issue number and title:** #5 — The most recently added song in a playlist is always
+missing.
+
+**2. How I reproduced it:** I built a playlist with 7 entries at positions 1–7 and called
+`get_playlist_songs(playlist_id)`. It returned **6** songs — "Track 1" through "Track 6" — with
+"Track 7" (the highest position) missing. The shipped `test_playlist_returns_all_songs`
+(expects 5, gets 4) and `test_playlist_returns_songs_in_order` both failed, confirming it. This
+also explains darius's "adding another song frees the previous one and hides the new one":
+whichever song is last by position is the one dropped, so each new add shifts which song is
+last.
+
+**3. How I found the root cause:** I traced `GET /playlists/<id>/songs` →
+`routes/playlists.py: get_songs()` → `playlist_service.get_playlist_songs()`. The function
+queries the songs joined to `playlist_entries`, filters by playlist, and orders by
+`playlist_entries.c.position` ascending — all correct. The bug is the very last line: the query
+result is sliced before being returned — `return [song.to_dict() for song in songs[:-1]]`. The
+`[:-1]` was the smoking gun: it's a Python slice that returns everything *except the last
+element*.
+
+**4. The root cause:** The return statement sliced off the last element of the ordered result
+with `songs[:-1]`. Because the query orders by `position` ascending, the last element is always
+the song with the highest position — i.e., the most recently added song. So the function
+silently discarded exactly one song, always the newest, on every call. Nothing about the query
+or ordering was wrong; a single stray slice threw away the last row. (The function's own
+docstring even says *"This function returns all songs in the playlist"* — the code contradicted
+its contract.)
+
+**5. My fix and side-effect check:** I removed the slice, changing
+`return [song.to_dict() for song in songs[:-1]]` to
+`return [song.to_dict() for song in songs]`, so every song is returned. Side-effect check — I
+verified boundary sizes because a slice bug is sensitive to list length: an **empty** playlist
+still returns `[]` (previously `[][:-1]` was also `[]`, so that case happened to look fine); a
+**single-song** playlist now correctly returns that one song (previously `[:-1]` reduced it to
+**zero** — a hidden second victim of the same bug); and a 7-song playlist returns all 7 in
+position order. All three tests in `tests/test_playlists.py` pass, including
+`test_playlist_returns_songs_in_order` (order preserved) and
+`test_empty_playlist_returns_empty_list`. The full suite is now **13 passed**.
